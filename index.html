@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Afinador PWA Simples</title>
+    <style>
+        body { font-family: sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; background: #222; color: white; margin: 0; }
+        
+        /* O Botão de Iniciar (Navegadores exigem interação para ligar o mic) */
+        #start-btn { padding: 15px 30px; font-size: 1.2rem; cursor: pointer; background: #00d2ff; border: none; border-radius: 5px; color: #000; font-weight: bold; }
+        
+        /* A Interface do Afinador */
+        .tuner-ui { display: none; text-align: center; }
+        .note { font-size: 8rem; font-weight: bold; color: #00d2ff; }
+        .freq { font-size: 1.5rem; color: #aaa; margin-top: -10px; }
+        .gauge { width: 300px; height: 20px; background: #444; border-radius: 10px; margin-top: 20px; position: relative; overflow: hidden; }
+        .marker { width: 4px; height: 100%; background: #fff; position: absolute; left: 50%; transform: translateX(-50%); }
+        .needle { width: 10px; height: 100%; background: #00d2ff; position: absolute; left: 50%; transition: left 0.1s; border-radius: 50%; transform: translateX(-50%); }
+        
+        /* Classes para indicar se está afinado ou não */
+        .perfect { color: #00ff6a; } 
+        .perfect .needle { background: #00ff6a; }
+    </style>
+</head>
+<body>
+
+    <button id="start-btn">Ligar Afinador</button>
+
+    <div class="tuner-ui" id="tuner-ui">
+        <div class="note" id="note-name">--</div>
+        <div class="freq"><span id="frequency">0</span> Hz</div>
+        
+        <div class="gauge">
+            <div class="marker"></div> <div class="needle" id="needle"></div> </div>
+        <p id="status">Toque uma corda...</p>
+    </div>
+
+<script>
+    // Notas musicais e suas frequências (C0 até B8)
+    const noteStrings = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+    let audioContext = null;
+    let analyser = null;
+    let mediaStreamSource = null;
+    let bufferLength = 2048; // Tamanho do buffer de áudio
+    let dataArray = new Float32Array(bufferLength);
+
+    document.getElementById('start-btn').addEventListener('click', async () => {
+        try {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            
+            mediaStreamSource = audioContext.createMediaStreamSource(stream);
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = bufferLength;
+            mediaStreamSource.connect(analyser);
+
+            document.getElementById('start-btn').style.display = 'none';
+            document.getElementById('tuner-ui').style.display = 'block';
+
+            updatePitch();
+        } catch (err) {
+            alert("Erro ao acessar microfone: " + err);
+        }
+    });
+
+    // --- O CORAÇÃO DO ALGORITMO (Autocorrelação) ---
+    function autoCorrelate(buf, sampleRate) {
+        let SIZE = buf.length;
+        let rms = 0;
+
+        // 1. Detectar se há som suficiente (Root Mean Square)
+        for (let i = 0; i < SIZE; i++) {
+            let val = buf[i];
+            rms += val * val;
+        }
+        rms = Math.sqrt(rms / SIZE);
+        if (rms < 0.01) return -1; // Muito silencioso (ruído de fundo)
+
+        // 2. Algoritmo de Autocorrelação para achar a frequência fundamental
+        let r1 = 0, r2 = SIZE - 1, thres = 0.2;
+        for (let i = 0; i < SIZE / 2; i++)
+            if (Math.abs(buf[i]) < thres) { r1 = i; break; }
+        for (let i = 1; i < SIZE / 2; i++)
+            if (Math.abs(buf[SIZE - i]) < thres) { r2 = SIZE - i; break; }
+
+        buf = buf.slice(r1, r2);
+        SIZE = buf.length;
+
+        let c = new Array(SIZE).fill(0);
+        for (let i = 0; i < SIZE; i++)
+            for (let j = 0; j < SIZE - i; j++)
+                c[i] = c[i] + buf[j] * buf[j + i];
+
+        let d = 0; while (c[d] > c[d + 1]) d++;
+        let maxval = -1, maxpos = -1;
+        
+        for (let i = d; i < SIZE; i++) {
+            if (c[i] > maxval) {
+                maxval = c[i];
+                maxpos = i;
+            }
+        }
+        let T0 = maxpos;
+
+        // Interpolação parabólica para maior precisão
+        let x1 = c[T0 - 1], x2 = c[T0], x3 = c[T0 + 1];
+        let a = (x1 + x3 - 2 * x2) / 2;
+        let b = (x3 - x1) / 2;
+        if (a) T0 = T0 - b / (2 * a);
+
+        return sampleRate / T0;
+    }
+
+    function updatePitch() {
+        analyser.getFloatTimeDomainData(dataArray);
+        let ac = autoCorrelate(dataArray, audioContext.sampleRate);
+
+        if (ac !== -1) {
+            let pitch = ac;
+            let note = noteFromPitch(pitch);
+            let detune = centsOffFromPitch(pitch, note);
+            
+            // Atualizar UI
+            let noteName = noteStrings[note % 12];
+            document.getElementById('note-name').innerText = noteName;
+            document.getElementById('frequency').innerText = Math.round(pitch);
+            
+            // Movimento da agulha (50% é o centro)
+            // Se detune for 0, left = 50%. Se detune for -50, left = 0%.
+            let needlePos = 50 + (detune / 2); 
+            // Limitar a agulha visualmente
+            if(needlePos < 5) needlePos = 5;
+            if(needlePos > 95) needlePos = 95;
+            
+            document.getElementById('needle').style.left = needlePos + "%";
+
+            // Feedback visual de "Afinado"
+            const ui = document.getElementById('note-name');
+            const status = document.getElementById('status');
+            
+            if (Math.abs(detune) < 5) {
+                ui.classList.add("perfect");
+                status.innerText = "AFINADO!";
+            } else {
+                ui.classList.remove("perfect");
+                status.innerText = detune < 0 ? "Muito Baixo (Aperte)" : "Muito Alto (Afrouxe)";
+            }
+        }
+
+        requestAnimationFrame(updatePitch);
+    }
+
+    // --- MATEMÁTICA DA MÚSICA ---
+    
+    function noteFromPitch(frequency) {
+        // Fórmula para descobrir o número da nota MIDI baseada na frequência
+        // 69 é o Lá (A4) = 440Hz
+        var noteNum = 12 * (Math.log(frequency / 440) / Math.log(2));
+        return Math.round(noteNum) + 69;
+    }
+
+    function frequencyFromNoteNumber(note) {
+        return 440 * Math.pow(2, (note - 69) / 12);
+    }
+
+    function centsOffFromPitch(frequency, note) {
+        // Calcula quão longe (em cents) a frequência está da nota ideal
+        return Math.floor(1200 * Math.log(frequency / frequencyFromNoteNumber(note)) / Math.log(2));
+    }
+</script>
+</body>
+</html>
